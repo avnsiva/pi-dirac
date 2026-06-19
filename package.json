@@ -1,0 +1,12 @@
+{
+  "name": "pi-dirac",
+  "version": "0.1.0",
+  "description": "Dirac's best features for Pi: hash-anchored edits, AST tools, condense, diagnostics",
+  "dependencies": {
+    "web-tree-sitter": "0.22.6",
+    "tree-sitter-wasms": "0.1.13"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  }
+}
