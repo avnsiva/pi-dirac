@@ -1,7 +1,7 @@
 /**
  * pi-dirac: Dirac's best features for Pi
  *
- * - Hash-anchored edits (intercept read/edit via tool_call hooks)
+ * - Hash-anchored edits (tool_result hook for read, tool_call for edit)
  * - AST tools (skeleton, get_function, find_references, rename/replace)
  * - Condense tool (expose compaction engine)
  * - Diagnostics scan (run linters via exec)
@@ -16,7 +16,6 @@ import {
 	annotateLinesWithAnchors,
 	anchorState,
 	resolveLineRef,
-	stripHashes,
 	extractId,
 	ANCHOR_DELIMITER,
 } from "./line-hashing.ts";
@@ -31,8 +30,8 @@ export default function (pi: ExtensionAPI) {
 ## Hash-Anchored Edit Mode (Active)
 
 When reading files, you will see line anchors: \`SymbolName§line content\` or \`LineNumber§line content\`.
-When editing, prefer using \`lineRef\` in the edit tool:
-\`{ "path": "file.ts", "lineRef": "MyFunction§    return x + 1;", "newText": "    return x + 2;" }\`
+When editing with the edit tool, you can use \`lineRef\` inside the \`edits\` array:
+\`{ "edits": [{ "lineRef": "MyFunction§    return x + 1;", "newText": "    return x + 2;" }] }\`
 This is more reliable than copying exact text. Always prefer lineRef when anchors are visible.`;
 
 		if (!event.systemPrompt.includes("Hash-Anchored Edit Mode")) {
@@ -40,45 +39,80 @@ This is more reliable than copying exact text. Always prefer lineRef when anchor
 		}
 	});
 
+	// Intercept read tool_call to cache file content for later anchor resolution
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName === "read") {
 			const input = event.input as any;
 			const filePath = input.path;
 			const absPath = filePath.startsWith("/") ? filePath : pathResolve(ctx.cwd, filePath);
-
 			try {
 				const content = readFileSync(absPath, "utf-8");
-				const annotated = annotateLinesWithAnchors(content, absPath);
 				anchorState.set(absPath, content);
-				input._piDiracAnnotated = annotated;
 			} catch {}
 		}
 
+		// Handle lineRef in edit tool's edits[] array
 		if (event.toolName === "edit") {
 			const input = event.input as any;
-			if (input.lineRef) {
-				const filePath = input.path;
-				const absPath = filePath.startsWith("/") ? filePath : pathResolve(ctx.cwd, filePath);
+			const edits = input.edits || [];
 
-				let fileContent = anchorState.get(absPath);
-				if (!fileContent) {
-					try {
-						fileContent = readFileSync(absPath, "utf-8");
-					} catch {
-						return { block: true, reason: `Cannot read file: ${filePath}` };
+			for (const edit of edits) {
+				if (edit.lineRef) {
+					const filePath = input.path;
+					const absPath = filePath.startsWith("/") ? filePath : pathResolve(ctx.cwd, filePath);
+
+					let fileContent = anchorState.get(absPath);
+					if (!fileContent) {
+						try {
+							fileContent = readFileSync(absPath, "utf-8");
+						} catch {
+							return { block: true, reason: `Cannot read file: ${filePath}` };
+						}
 					}
-				}
 
-				const resolved = resolveLineRef(input.lineRef, fileContent);
-				if (!resolved) {
-					return { block: true, reason: `Could not resolve lineRef: ${input.lineRef}` };
-				}
+					const resolved = resolveLineRef(edit.lineRef, fileContent);
+					if (!resolved) {
+						return { block: true, reason: `Could not resolve lineRef: ${edit.lineRef}` };
+					}
 
-				input.oldText = resolved;
-				if (!input.newText) input.newText = "";
-				delete input.lineRef;
+					edit.oldText = resolved;
+					delete edit.lineRef;
+				}
 			}
 		}
+	});
+
+	// Post-process read results to add hash anchors to output
+	pi.on("tool_result", async (event, _ctx) => {
+		if (event.toolName !== "read") return;
+		if (!event.content || event.content.length === 0) return;
+
+		const textBlock = event.content.find((c: any) => c.type === "text");
+		if (!textBlock) return;
+		const text = (textBlock as any).text as string;
+		if (!text) return;
+
+		// Find the file path from the tool input
+		const input = (event as any).input;
+		const filePath = input?.path;
+		if (!filePath) return;
+
+		const absPath = filePath.startsWith("/") ? filePath : filePath;
+		const originalContent = anchorState.get(absPath);
+		if (!originalContent) return;
+
+		// Annotate with hash anchors
+		const annotated = annotateLinesWithAnchors(originalContent, absPath);
+
+		// Return the annotated version instead of the plain text
+		const modifiedContent = event.content.map((c: any) => {
+			if (c.type === "text") {
+				return { ...c, text: annotated };
+			}
+			return c;
+		});
+
+		return { content: modifiedContent };
 	});
 
 	// ── AST Skeleton Tool ────────────────────────────────────────────────
@@ -158,10 +192,7 @@ This is more reliable than copying exact text. Always prefer lineRef when anchor
 				};
 			}
 
-			const content = readFileSync(absPath, "utf-8");
-			const lines = content.split("\n");
 			const defs = await parseFile(absPath);
-
 			if (!defs) {
 				return {
 					content: [{ type: "text", text: "Could not parse file" }],
@@ -177,14 +208,36 @@ This is more reliable than copying exact text. Always prefer lineRef when anchor
 				};
 			}
 
+			const content = readFileSync(absPath, "utf-8");
+			const lines = content.split("\n");
 			const startLine = target.lineIndex;
+			const startIndent = target.indentation.length;
 			let endLine = startLine;
-			const indent = target.indentation.length;
 
-			for (let i = startLine + 1; i < lines.length; i++) {
-				const lineIndent = (lines[i].match(/^\s*/)?.[0] || "").length;
-				if (lineIndent <= indent && lines[i].trim().length > 0) {
+			// Find end of block by tracking brace depth
+			let braceDepth = 0;
+			let foundOpenBrace = false;
+			for (let i = startLine; i < lines.length; i++) {
+				const line = lines[i];
+				for (const ch of line) {
+					if (ch === "{") {
+						braceDepth++;
+						foundOpenBrace = true;
+					} else if (ch === "}") {
+						braceDepth--;
+					}
+				}
+				if (foundOpenBrace && braceDepth <= 0) {
+					endLine = i;
 					break;
+				}
+				// For languages without braces (Python, etc.), use indent
+				if (i > startLine && !foundOpenBrace) {
+					const lineIndent = (lines[i].match(/^\s*/)?.[0] || "").length;
+					if (lineIndent <= startIndent && lines[i].trim().length > 0) {
+						endLine = i - 1;
+						break;
+					}
 				}
 				endLine = i;
 			}
@@ -310,15 +363,39 @@ This is more reliable than copying exact text. Always prefer lineRef when anchor
 				};
 			}
 
-			const indent = (lines[targetLine].match(/^\s*/)?.[0] || "").length;
+			// Use brace tracking for brace languages, indent for others
+			const startIndent = (lines[targetLine].match(/^\s*/)?.[0] || "").length;
 			let endLine = targetLine;
-			for (let i = targetLine + 1; i < lines.length; i++) {
-				const lineIndent = (lines[i].match(/^\s*/)?.[0] || "").length;
-				if (lineIndent <= indent && lines[i].trim().length > 0) break;
-				endLine = i;
+			const ext = absPath.split(".").pop() || "";
+			const isBraceLanguage = ["ts", "tsx", "js", "jsx", "java", "kt", "go", "rs", "c", "cpp", "cs", "php", "swift", "zig"].includes(ext);
+
+			if (isBraceLanguage) {
+				let braceDepth = 0;
+				let foundOpenBrace = false;
+				for (let i = targetLine; i < lines.length; i++) {
+					for (const ch of lines[i]) {
+						if (ch === "{") { braceDepth++; foundOpenBrace = true; }
+						else if (ch === "}") braceDepth--;
+					}
+					if (foundOpenBrace && braceDepth <= 0) {
+						endLine = i;
+						break;
+					}
+					endLine = i;
+				}
+			} else {
+				// Python-style: use indent
+				for (let i = targetLine + 1; i < lines.length; i++) {
+					const lineIndent = (lines[i].match(/^\s*/)?.[0] || "").length;
+					if (lineIndent <= startIndent && lines[i].trim().length > 0) {
+						endLine = i - 1;
+						break;
+					}
+					endLine = i;
+				}
 			}
 
-			const newLines = params.newText.split("\n").map((l) => " ".repeat(indent) + l);
+			const newLines = params.newText.split("\n").map((l) => " ".repeat(startIndent) + l);
 			lines.splice(targetLine, endLine - targetLine + 1, ...newLines);
 
 			const { writeFileSync } = await import("node:fs");
@@ -340,11 +417,16 @@ This is more reliable than copying exact text. Always prefer lineRef when anchor
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			try {
-				await ctx.compact();
-				const usage = ctx.getContextUsage();
+				if (typeof ctx.compact === "function") {
+					await ctx.compact();
+					return {
+						content: [{ type: "text", text: "Context condensed successfully" }],
+						details: {},
+					};
+				}
 				return {
-					content: [{ type: "text", text: `Context condensed. Usage: ${Math.round(usage.totalTokens / 1000)}k tokens` }],
-					details: { tokens: usage.totalTokens },
+					content: [{ type: "text", text: "Compaction not available in this mode" }],
+					details: {},
 				};
 			} catch (error: any) {
 				return {
@@ -369,28 +451,26 @@ This is more reliable than copying exact text. Always prefer lineRef when anchor
 			const ext = absPath.split(".").pop();
 
 			const commands: Record<string, string> = {
-				ts: `npx tsc --noEmit --pretty false "${absPath}" 2>&1 || true`,
-				tsx: `npx tsc --noEmit --pretty false "${absPath}" 2>&1 || true`,
-				js: `npx eslint "${absPath}" --format compact 2>&1 || true`,
-				jsx: `npx eslint "${absPath}" --format compact 2>&1 || true`,
-				py: `python -m py_compile "${absPath}" 2>&1 || python -m flake8 "${absPath}" 2>&1 || true`,
+				ts: `npx typescript --noEmit --pretty false "${absPath}" 2>&1 || npx tsc --noEmit --pretty false "${absPath}" 2>&1 || true`,
+				tsx: `npx typescript --noEmit --pretty false "${absPath}" 2>&1 || npx tsc --noEmit --pretty false "${absPath}" 2>&1 || true`,
+				py: `python3 -m py_compile "${absPath}" 2>&1 || python3 -m flake8 "${absPath}" 2>&1 || true`,
 			};
 
 			const cmd = commands[ext || ""];
 			if (!cmd) {
 				return {
-					content: [{ type: "text", text: `No linter configured for .${ext} files` }],
+					content: [{ type: "text", text: `No linter configured for .${ext} files. Supported: .ts, .tsx, .py` }],
 					details: {},
 				};
 			}
 
 			const result = await pi.exec("bash", ["-c", cmd], { cwd: ctx.cwd });
-			const output = result.stdout + result.stderr;
-			const lines = output.split("\n").filter((l) => l.trim()).slice(0, 50);
+			const output = (result.stdout || "") + (result.stderr || "");
+			const outputLines = output.split("\n").filter((l) => l.trim()).slice(0, 50);
 
 			return {
-				content: [{ type: "text", text: lines.length > 0 ? lines.join("\n") : "No diagnostics found" }],
-				details: { exitCode: result.exitCode, lines: lines.length },
+				content: [{ type: "text", text: outputLines.length > 0 ? outputLines.join("\n") : "No diagnostics found" }],
+				details: { exitCode: result.exitCode, lines: outputLines.length },
 			};
 		},
 	});
