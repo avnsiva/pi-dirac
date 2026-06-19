@@ -40,6 +40,8 @@ export interface ParsedDefinition {
 	lineCount?: number;
 }
 
+const EXT_DIR = path.resolve(__dirname, "..");
+
 async function initParser() {
 	if (isInitialized) return;
 	if (!initPromise) {
@@ -48,13 +50,14 @@ async function initParser() {
 			Parser = mod.default || mod;
 			await Parser.init({
 				locateFile(scriptName: string) {
-					const wasmPath = path.join(
-						process.cwd(),
-						"node_modules",
-						"web-tree-sitter",
-						scriptName,
-					);
-					if (fs.existsSync(wasmPath)) return wasmPath;
+					const searchPaths = [
+						path.join(EXT_DIR, "node_modules", "web-tree-sitter", scriptName),
+						path.join(process.cwd(), ".pi", "extensions", "pi-dirac", "node_modules", "web-tree-sitter", scriptName),
+						path.join(process.cwd(), "node_modules", "web-tree-sitter", scriptName),
+					];
+					for (const p of searchPaths) {
+						if (fs.existsSync(p)) return p;
+					}
 					return scriptName;
 				},
 			});
@@ -68,8 +71,9 @@ async function loadLanguage(langName: string): Promise<any> {
 	if (langCache.has(langName)) return langCache.get(langName);
 	const wasmName = `tree-sitter-${langName}.wasm`;
 	const searchPaths = [
+		path.join(EXT_DIR, "node_modules", "tree-sitter-wasms", "out", wasmName),
+		path.join(process.cwd(), ".pi", "extensions", "pi-dirac", "node_modules", "tree-sitter-wasms", "out", wasmName),
 		path.join(process.cwd(), "node_modules", "tree-sitter-wasms", "out", wasmName),
-		path.join(__dirname, "..", "node_modules", "tree-sitter-wasms", "out", wasmName),
 	];
 	for (const wasmPath of searchPaths) {
 		try {
