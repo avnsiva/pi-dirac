@@ -1,7 +1,7 @@
 /**
  * pi-dirac: Dirac's best features for Pi
  *
- * - Hash-anchored edits (tool_result hook for read, tool_call for edit)
+ * - Hash-anchored edits (override edit tool with lineRef support)
  * - AST tools (skeleton, get_function, find_references, rename/replace)
  * - Condense tool (expose compaction engine)
  * - Diagnostics scan (run linters via exec)
@@ -30,8 +30,8 @@ export default function (pi: ExtensionAPI) {
 ## Hash-Anchored Edit Mode (Active)
 
 When reading files, you will see line anchors: \`SymbolName§line content\` or \`LineNumber§line content\`.
-When editing with the edit tool, you can use \`lineRef\` inside the \`edits\` array:
-\`{ "edits": [{ "lineRef": "MyFunction§    return x + 1;", "newText": "    return x + 2;" }] }\`
+When editing, use the \`edit\` tool with \`lineRef\` inside the \`edits\` array:
+\`{ "path": "file.ts", "edits": [{ "lineRef": "MyFunction§    return x + 1;", "newText": "    return x + 2;" }] }\`
 This is more reliable than copying exact text. Always prefer lineRef when anchors are visible.`;
 
 		if (!event.systemPrompt.includes("Hash-Anchored Edit Mode")) {
@@ -39,7 +39,7 @@ This is more reliable than copying exact text. Always prefer lineRef when anchor
 		}
 	});
 
-	// Intercept read tool_call to cache file content for later anchor resolution
+	// Cache file content when read is called
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName === "read") {
 			const input = event.input as any;
@@ -50,49 +50,16 @@ This is more reliable than copying exact text. Always prefer lineRef when anchor
 				anchorState.set(absPath, content);
 			} catch {}
 		}
-
-		// Handle lineRef in edit tool's edits[] array
-		if (event.toolName === "edit") {
-			const input = event.input as any;
-			const edits = input.edits || [];
-
-			for (const edit of edits) {
-				if (edit.lineRef) {
-					const filePath = input.path;
-					const absPath = filePath.startsWith("/") ? filePath : pathResolve(ctx.cwd, filePath);
-
-					let fileContent = anchorState.get(absPath);
-					if (!fileContent) {
-						try {
-							fileContent = readFileSync(absPath, "utf-8");
-						} catch {
-							return { block: true, reason: `Cannot read file: ${filePath}` };
-						}
-					}
-
-					const resolved = resolveLineRef(edit.lineRef, fileContent);
-					if (!resolved) {
-						return { block: true, reason: `Could not resolve lineRef: ${edit.lineRef}` };
-					}
-
-					edit.oldText = resolved;
-					delete edit.lineRef;
-				}
-			}
-		}
 	});
 
-	// Post-process read results to add hash anchors to output
+	// Post-process read results to add hash anchors
 	pi.on("tool_result", async (event, _ctx) => {
 		if (event.toolName !== "read") return;
 		if (!event.content || event.content.length === 0) return;
 
 		const textBlock = event.content.find((c: any) => c.type === "text");
 		if (!textBlock) return;
-		const text = (textBlock as any).text as string;
-		if (!text) return;
 
-		// Find the file path from the tool input
 		const input = (event as any).input;
 		const filePath = input?.path;
 		if (!filePath) return;
@@ -101,10 +68,8 @@ This is more reliable than copying exact text. Always prefer lineRef when anchor
 		const originalContent = anchorState.get(absPath);
 		if (!originalContent) return;
 
-		// Annotate with hash anchors
 		const annotated = annotateLinesWithAnchors(originalContent, absPath);
 
-		// Return the annotated version instead of the plain text
 		const modifiedContent = event.content.map((c: any) => {
 			if (c.type === "text") {
 				return { ...c, text: annotated };
@@ -113,6 +78,57 @@ This is more reliable than copying exact text. Always prefer lineRef when anchor
 		});
 
 		return { content: modifiedContent };
+	});
+
+	// ── Override Edit Tool with lineRef Support ──────────────────────────
+
+	pi.registerTool({
+		name: "edit",
+		label: "Edit",
+		description:
+			"Apply edits to a file. Each edit has oldText (text to find) and newText (replacement). Use lineRef instead of oldText when hash anchors are visible from a recent read.",
+		parameters: Type.Object({
+			path: Type.String({ description: "Absolute path to the file to edit" }),
+			edits: Type.Array(
+				Type.Object({
+					oldText: Type.Optional(Type.String({ description: "Exact text to find and replace" })),
+					newText: Type.String({ description: "Replacement text" }),
+					lineRef: Type.Optional(
+						Type.String({
+							description:
+								"Hash-anchored line reference from read output (e.g., MyFunction§    return x;). Resolves to oldText automatically.",
+						}),
+					),
+				}),
+				{ description: "Array of edits to apply" },
+			),
+		}),
+		prepareArguments(args: any) {
+			// Resolve lineRef to oldText before schema validation
+			if (args.edits && Array.isArray(args.edits)) {
+				for (const edit of args.edits) {
+					if (edit.lineRef && !edit.oldText) {
+						const filePath = args.path;
+						const absPath = filePath.startsWith("/") ? filePath : filePath;
+						const fileContent = anchorState.get(absPath);
+						if (fileContent) {
+							const resolved = resolveLineRef(edit.lineRef, fileContent);
+							if (resolved) {
+								edit.oldText = resolved;
+							}
+						}
+						delete edit.lineRef;
+					} else if (edit.lineRef && edit.oldText) {
+						delete edit.lineRef;
+					}
+				}
+			}
+			return args;
+		},
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			const { editFile } = await import("./edit-impl.ts");
+			return editFile(params, ctx);
+		},
 	});
 
 	// ── AST Skeleton Tool ────────────────────────────────────────────────
@@ -213,33 +229,32 @@ This is more reliable than copying exact text. Always prefer lineRef when anchor
 			const startLine = target.lineIndex;
 			const startIndent = target.indentation.length;
 			let endLine = startLine;
+			const ext = absPath.split(".").pop() || "";
+			const isBraceLanguage = ["ts", "tsx", "js", "jsx", "java", "kt", "go", "rs", "c", "cpp", "cs", "php", "swift", "zig"].includes(ext);
 
-			// Find end of block by tracking brace depth
-			let braceDepth = 0;
-			let foundOpenBrace = false;
-			for (let i = startLine; i < lines.length; i++) {
-				const line = lines[i];
-				for (const ch of line) {
-					if (ch === "{") {
-						braceDepth++;
-						foundOpenBrace = true;
-					} else if (ch === "}") {
-						braceDepth--;
+			if (isBraceLanguage) {
+				let braceDepth = 0;
+				let foundOpenBrace = false;
+				for (let i = startLine; i < lines.length; i++) {
+					for (const ch of lines[i]) {
+						if (ch === "{") { braceDepth++; foundOpenBrace = true; }
+						else if (ch === "}") braceDepth--;
 					}
-				}
-				if (foundOpenBrace && braceDepth <= 0) {
+					if (foundOpenBrace && braceDepth <= 0) {
+						endLine = i;
+						break;
+					}
 					endLine = i;
-					break;
 				}
-				// For languages without braces (Python, etc.), use indent
-				if (i > startLine && !foundOpenBrace) {
+			} else {
+				for (let i = startLine + 1; i < lines.length; i++) {
 					const lineIndent = (lines[i].match(/^\s*/)?.[0] || "").length;
 					if (lineIndent <= startIndent && lines[i].trim().length > 0) {
 						endLine = i - 1;
 						break;
 					}
+					endLine = i;
 				}
-				endLine = i;
 			}
 
 			const body = lines.slice(startLine, endLine + 1).join("\n");
@@ -315,9 +330,8 @@ This is more reliable than copying exact text. Always prefer lineRef when anchor
 				return line.replace(regex, params.newName);
 			});
 
-			const newContent = edited.join("\n");
 			const { writeFileSync } = await import("node:fs");
-			writeFileSync(absPath, newContent, "utf-8");
+			writeFileSync(absPath, edited.join("\n"), "utf-8");
 
 			return {
 				content: [{ type: "text", text: `Renamed "${params.oldName}" → "${params.newName}" (${refs.length} occurrences)` }],
@@ -331,10 +345,10 @@ This is more reliable than copying exact text. Always prefer lineRef when anchor
 	pi.registerTool({
 		name: "replace_symbol",
 		label: "Replace Symbol",
-		description: "Replace a function/class body at a specific line using AST-aware anchoring",
+		description: "Replace a function/class body at a specific line using numeric line reference",
 		parameters: Type.Object({
 			path: Type.String({ description: "File path" }),
-			lineRef: Type.String({ description: "Hash-anchored line reference (e.g., MyFunction§    return x;)" }),
+			lineRef: Type.String({ description: "Line reference (e.g., 14 or MyFunction§...)" }),
 			newText: Type.String({ description: "New content to replace the symbol body with" }),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -347,23 +361,15 @@ This is more reliable than copying exact text. Always prefer lineRef when anchor
 			const numericId = Number.parseInt(id, 10);
 			if (!Number.isNaN(numericId) && numericId >= 1 && numericId <= lines.length) {
 				targetLine = numericId - 1;
-			} else {
-				for (let i = 0; i < lines.length; i++) {
-					if (lines[i].startsWith(id + ANCHOR_DELIMITER)) {
-						targetLine = i;
-						break;
-					}
-				}
 			}
 
 			if (targetLine === -1) {
 				return {
-					content: [{ type: "text", text: `Could not resolve lineRef: ${params.lineRef}` }],
+					content: [{ type: "text", text: `Could not resolve lineRef: ${params.lineRef}. Use numeric line number (e.g., 14).` }],
 					details: {},
 				};
 			}
 
-			// Use brace tracking for brace languages, indent for others
 			const startIndent = (lines[targetLine].match(/^\s*/)?.[0] || "").length;
 			let endLine = targetLine;
 			const ext = absPath.split(".").pop() || "";
@@ -384,7 +390,6 @@ This is more reliable than copying exact text. Always prefer lineRef when anchor
 					endLine = i;
 				}
 			} else {
-				// Python-style: use indent
 				for (let i = targetLine + 1; i < lines.length; i++) {
 					const lineIndent = (lines[i].match(/^\s*/)?.[0] || "").length;
 					if (lineIndent <= startIndent && lines[i].trim().length > 0) {
